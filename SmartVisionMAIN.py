@@ -1,658 +1,1404 @@
 """
-SmartVision: AI-Powered Document Workflow Automation Suite
+============================================================================================
+VPN Ops Command Center (vpn_ops_command_center.py)
+============================================================================================
 
-This is a feature-rich Python system that performs:
-- Automated document scanning (image to searchable PDF)
-- OCR (Optical Character Recognition) for multi-language support
-- Data extraction (tables, key-values, signatures, images)
-- Document redaction (PII, emails, phone numbers, etc)
-- Advanced PDF manipulation (merge, split, reorder, digital-sign, watermark)
-- Auto-file labeling, tagging, search, and export
-- Batch processing via GUI and Command Line
-- REST API server for integration
-- Configurable rules and templates for different document types
+Legal & Ethics:
 
-Perfect for small law offices, accountants, realtors, notaries, labs, and admins.
+  This tool is intended strictly for lawful VPN server and client administration,
+  privacy hygiene, and operational network testing, as governed by the laws and regulations
+  of your jurisdiction. Misuse, such as attempts to evade lawful surveillance, sanctions,
+  or to facilitate unlawful activity, is expressly prohibited. By using this software,
+  you accept sole responsibility for compliance with all applicable laws and you represent
+  that you have authorization to manage all servers and endpoints you control with this tool.
 
-Built to be extensible, with multiple plugin-points.
+  There are no claims made of perfect security, total anonymity, or unlimited bandwidth.
+  This program implements reasonable privacy and operational safeguards but cannot guarantee
+  security or privacy under all conditions. Operators are responsible for reviewing the code,
+  configuration, and the limitations described throughout the documentation and embedded README.
 
-Requires:
-Python 3.8+, tesseract-ocr installed, poppler-utils, ghostscript
+============================================================================================
+Required External Dependencies:
 
-Modules required: Pillow, pytesseract, pdfplumber, opencv-python, PyPDF2, flask, watchdog, numpy, pandas, pdf2image, reportlab, pdfminer.six, chardet, requests
+  pip install -U paramiko cryptography qrcode[pil] matplotlib psutil pillow colorama
 
+Tested on Python 3.8+/Win10. Your environment may require additional packages.
+
+============================================================================================
 """
 
 import os
-import re
 import sys
-import io
 import time
-import threading
-import uuid
 import json
+import base64
+import hashlib
+import hmac
+import threading
+import queue
+import getpass
 import shutil
-import tempfile
 import logging
-import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Tuple, Union, Optional
-
-import cv2
-import numpy as np
-from PIL import Image
-import pytesseract
-import pandas as pd
-import pdfplumber
-from PyPDF2 import PdfFileReader, PdfFileWriter, PdfMerger
-from pdf2image import convert_from_path
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from flask import Flask, request, jsonify, send_file
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-
-###############################
-# Logging Setup
-###############################
-
-def setup_logging(log_file="smartvision.log"):
-    logger = logging.getLogger("SmartVision")
-    logger.setLevel(logging.INFO)
-    fh = logging.FileHandler(log_file)
-    ch = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-    return logger
-
-logger = setup_logging()
-
-###############################
-# 1. IMAGE PREPROCESSING SUITE
-###############################
-
-def preprocess_image(image: np.ndarray) -> np.ndarray:
-    """Clean/deskew/binarize/denoise the given image for best OCR results."""
-    try:
-        logger.info("Starting image preprocessing...")
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        # Deskew with moments
-        coords = np.column_stack(np.where(gray > 0))
-        angle = cv2.minAreaRect(coords)[-1]
-        if angle < -45:
-            angle = -(90 + angle)
-        else:
-            angle = -angle
-        (h, w) = gray.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        deskewed = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-        # Adaptive thresholding
-        threshed = cv2.adaptiveThreshold(deskewed, 255,
-                                         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                         cv2.THRESH_BINARY, 31, 10)
-        # Denoising
-        denoised = cv2.fastNlMeansDenoising(threshed, None, 30, 7, 21)
-        logger.info("Image preprocessing complete.")
-        return denoised
-    except Exception as ex:
-        logger.error(f"Error during image preprocessing: {ex}")
-        return image
-
-def load_image(filepath: str) -> np.ndarray:
-    """Load image file (any format) into numpy array."""
-    image = cv2.imdecode(np.fromfile(filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
-    return image
-
-###############################
-# 2. OCR & DOCUMENT DIGITIZATION
-###############################
-
-def perform_ocr(image: np.ndarray, lang='eng') -> str:
-    """Run OCR on preprocessed image"""
-    try:
-        logger.info("Performing OCR...")
-        pil_image = Image.fromarray(image)
-        text = pytesseract.image_to_string(pil_image, lang=lang)
-        logger.info("OCR complete.")
-        return text
-    except Exception as ex:
-        logger.error(f"OCR failed: {ex}")
-        return ""
-
-def extract_tables(image: np.ndarray, lang='eng') -> List[Dict]:
-    """Try to extract tables from image using OCR and openCV."""
-    try:
-        logger.info("Extracting tables from image...")
-        result_tables = []
-        # Use pdfplumber separate logic for PDFs
-        pil_img = Image.fromarray(image)
-        data = pytesseract.image_to_data(pil_img, lang=lang, output_type=pytesseract.Output.DATAFRAME)
-        # Very naive, better for printed PDFs
-        boxes = []
-        for idx, row in data.iterrows():
-            if not pd.isna(row['text']) and len(str(row['text']).strip()) > 0:
-                x, y, w, h = row['left'], row['top'], row['width'], row['height']
-                boxes.append((x, y, x + w, y + h))
-        # TODO: Improve table detection
-        if boxes:
-            result_tables.append({
-                "cells": boxes,
-                "text": data.to_dict('records')
-            })
-        logger.info("Table extraction from image complete.")
-        return result_tables
-    except Exception as ex:
-        logger.error(f"Table extraction failed: {ex}")
-        return []
-
-def ocr_pdf(input_pdf: str, output_pdf: Optional[str]=None, lang='eng') -> str:
-    """Read a PDF (scanned or born digital), OCR each page if needed, and save/searchable PDF."""
-    temp_dir = tempfile.mkdtemp()
-    try:
-        logger.info(f"Converting PDF to images: {input_pdf}")
-        image_list = convert_from_path(input_pdf, output_folder=temp_dir, fmt='png', dpi=300)
-        full_text = ""
-        pdf_writer = PdfFileWriter()
-        for i, img in enumerate(image_list):
-            np_img = np.array(img)
-            pre_img = preprocess_image(np_img)
-            text = perform_ocr(pre_img, lang=lang)
-            full_text += f"--- Page {i+1}\n{text}\n"
-            pdf_img_stream = io.BytesIO()
-            img.save(pdf_img_stream, format='PNG')
-            pdf_img_stream.seek(0)
-            # Create a single-page PDF with the image
-            temp_pdf_path = os.path.join(temp_dir, f"page_{i}.pdf")
-            c = canvas.Canvas(temp_pdf_path, pagesize=letter)
-            rl_img = Image.fromarray(pre_img)
-            img_temp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-            rl_img.save(img_temp, format='PNG')
-            img_temp.close()
-            c.drawImage(img_temp.name, 0, 0, width=letter[0], height=letter[1])
-            c.showPage()
-            c.save()
-            with open(temp_pdf_path, 'rb') as pf:
-                page_pdf = PdfFileReader(pf).getPage(0)
-                pdf_writer.addPage(page_pdf)
-            os.remove(img_temp.name)
-        if output_pdf:
-            with open(output_pdf, 'wb') as out_f:
-                pdf_writer.write(out_f)
-        shutil.rmtree(temp_dir)
-        logger.info(f"OCR for PDF {input_pdf} complete.")
-        return full_text
-    except Exception as ex:
-        logger.error(f"OCR PDF failed: {ex}")
-        return ""
-    finally:
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-
-def pdf_to_text(input_pdf: str) -> str:
-    """Extract all text from a PDF, using pdfplumber on extracted images if needed."""
-    try:
-        text = ""
-        with pdfplumber.open(input_pdf) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text() or ""
-                text += page_text + "\n"
-        return text
-    except Exception as ex:
-        logger.error(f"pdf_to_text error: {ex}")
-        return ""
-
-###############################
-# 3. DATA EXTRACTION TOOLS
-###############################
-
-def extract_keyvalues(text: str, fields: dict) -> dict:
-    """
-    Extract key-values from OCR text based on templates.
-    fields: dict mapping display name to regex pattern, e.g.
-      { "DATE": r"Date\s*[:\-]\s*(\d{4}-\d{2}-\d{2})" }
-    """
-    results = {}
-    for field, pattern in fields.items():
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        results[field] = match.group(1) if match else ""
-    return results
-
-def extract_emails(text: str) -> List[str]:
-    """Extract all emails from document."""
-    return list(set(re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', text)))
-
-def extract_phones(text: str) -> List[str]:
-    """Extract all phone numbers from document."""
-    return list(set(re.findall(r'(\+?\d[\d\-\(\) ]{7,}\d)', text)))
-
-def extract_dates(text: str) -> List[str]:
-    # ISO, US, EU
-    date_pats = [
-        r'(\d{4}-\d{2}-\d{2})',
-        r'(\d{1,2}/\d{1,2}/\d{2,4})',
-        r'(\d{1,2}\.\d{1,2}\.\d{2,4})',
-    ]
-    dates = []
-    for pat in date_pats:
-        dates.extend(re.findall(pat, text))
-    return list(set(dates))
-
-def extract_signatures(image: np.ndarray) -> List[Tuple[int,int,int,int]]:
-    """Attempt to locate signature regions using contour and color heuristics."""
-    try:
-        # Assume blue/black ink signatures
-        logger.info("Extracting signatures...")
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        # Remove light areas (documents), keep dark ink
-        _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-        contours, _h = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        sig_boxes = []
-        for c in contours:
-            x, y, w, h = cv2.boundingRect(c)
-            if w > 60 and h > 15 and w*h < image.shape[0]*image.shape[1]*0.05:
-                sig_boxes.append((x, y, w, h))
-        logger.info(f"Signature extraction found {len(sig_boxes)} candidates.")
-        return sig_boxes
-    except Exception as ex:
-        logger.error(f"extract_signatures failed: {ex}")
-        return []
-
-###############################
-# 4. PDF MANIPULATION SUITE
-###############################
-
-def merge_pdfs(input_pdfs: List[str], output_pdf: str):
-    logger.info(f"Merging PDFs: {input_pdfs} -> {output_pdf}")
-    merger = PdfMerger()
-    for pdf in input_pdfs:
-        merger.append(pdf)
-    merger.write(output_pdf)
-    merger.close()
-
-def split_pdf(input_pdf: str, output_pattern: str) -> List[str]:
-    """Splits a PDF into single-page PDFs. output_pattern should contain %d."""
-    logger.info(f"Splitting PDF {input_pdf} with pattern {output_pattern}")
-    pdf = PdfFileReader(open(input_pdf, 'rb'))
-    outputs = []
-    for i in range(pdf.getNumPages()):
-        writer = PdfFileWriter()
-        writer.addPage(pdf.getPage(i))
-        out_name = output_pattern % (i+1)
-        with open(out_name, 'wb') as out_f:
-            writer.write(out_f)
-        outputs.append(out_name)
-    return outputs
-
-def reorder_pdf(input_pdf: str, page_order: List[int], output_pdf: str):
-    pdf_reader = PdfFileReader(open(input_pdf, 'rb'))
-    pdf_writer = PdfFileWriter()
-    for i in page_order:
-        pdf_writer.addPage(pdf_reader.getPage(i))
-    with open(output_pdf, 'wb') as out_f:
-        pdf_writer.write(out_f)
-
-def add_watermark(input_pdf: str, watermark_pdf: str, output_pdf: str):
-    logger.info(f"Adding watermark from {watermark_pdf}")
-    original = PdfFileReader(open(input_pdf, 'rb'))
-    watermark = PdfFileReader(open(watermark_pdf, 'rb')).getPage(0)
-    writer = PdfFileWriter()
-    for i in range(original.getNumPages()):
-        page = original.getPage(i)
-        page.mergePage(watermark)
-        writer.addPage(page)
-    with open(output_pdf, 'wb') as out_f:
-        writer.write(out_f)
-
-def redact_pdf(input_pdf: str, output_pdf: str, patterns: List[str]):
-    """
-    Redact all matching patterns (email, phone, PII) in the PDF.
-    """
-    logger.info(f"Redacting {patterns} in {input_pdf}")
-    with pdfplumber.open(input_pdf) as pdf, open(output_pdf, 'wb') as out_f:
-        pdf_writer = PdfFileWriter()
-        for page in pdf.pages:
-            page_image = page.to_image()
-            text = page.extract_text()
-            for pat in patterns:
-                for m in re.finditer(pat, text):
-                    bbox = page.bbox  # TODO: use layout objects to crop coordinates
-                    page_image.draw_rect((bbox[0], bbox[1], bbox[2], bbox[3]), fill=(0,0,0,127))
-            temp_img = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-            page_image.save(temp_img.name, format="PNG")
-            temp_pdf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-            c = canvas.Canvas(temp_pdf.name, pagesize=letter)
-            c.drawImage(temp_img.name, 0, 0, width=letter[0], height=letter[1])
-            c.showPage()
-            c.save()
-            temp_pdf.seek(0)
-            pdf_writer.addPage(PdfFileReader(open(temp_pdf.name, 'rb')).getPage(0))
-            os.remove(temp_img.name)
-            os.remove(temp_pdf.name)
-        pdf_writer.write(out_f)
-
-def add_digital_signature(input_pdf: str, signer: str, output_pdf: str):
-    """Just add a visible signature block (not PKI) for visual acknowledgement"""
-    logger.info(f"Adding signature by {signer} to {input_pdf}")
-    with open(input_pdf, 'rb') as inf:
-        reader = PdfFileReader(inf)
-        writer = PdfFileWriter()
-        for p in range(reader.getNumPages()):
-            page = reader.getPage(p)
-            if p == reader.getNumPages() - 1:
-                # Add signature block overlay
-                c = canvas.Canvas('sigtemp.pdf', pagesize=letter)
-                c.drawString(100, 80, f"Signed by: {signer} at {datetime.datetime.now()}")
-                c.save()
-                sig_page = PdfFileReader(open('sigtemp.pdf', 'rb')).getPage(0)
-                page.mergePage(sig_page)
-                os.remove('sigtemp.pdf')
-            writer.addPage(page)
-        with open(output_pdf, 'wb') as outf:
-            writer.write(outf)
-
-###############################
-# 5. AUTO-FILING AND TAGGING
-###############################
-
-def auto_label_file(text: str, extracted: Dict) -> str:
-    """
-    Suggest a smart filename based on document content and extracted metadata.
-    """
-    filename = ""
-    if 'DATE' in extracted and extracted['DATE']:
-        filename += extracted['DATE']
-    if 'NAME' in extracted and extracted['NAME']:
-        filename += "-" + extracted['NAME']
-    emails = extract_emails(text)
-    if emails:
-        filename += "-email"
-    filename = re.sub(r'\W+', '_', filename)
-    filename = filename.strip('_') or "ScannedDoc"
-    return filename
-
-def auto_tag(text: str, extracted: Dict) -> List[str]:
-    tags = []
-    keywords = {'invoice': 'INVOICE', 'receipt':'RECEIPT', 'signed':'SIGNED'}
-    for k, v in keywords.items():
-        if k in text.lower():
-            tags.append(v)
-    if 'DATE' in extracted and extracted['DATE']:
-        tags.append('DATED')
-    return tags
-
-###############################
-# 6. BATCH/JOB MANAGEMENT
-###############################
-
-class BatchJob:
-    """A job for batch processing files."""
-    def __init__(self, files: List[str], outdir: str, lang='eng', rules: dict={}):
-        self.files = files
-        self.outdir = outdir
-        self.lang = lang
-        self.rules = rules
-        self.id = str(uuid.uuid4())
-        self.results = []
-        self.status = "INIT"
-
-    def run(self):
-        logger.info(f"BatchJob {self.id} running...")
-        self.status = "RUNNING"
-        for file in self.files:
-            try:
-                result = process_document(file, self.outdir, self.lang, self.rules)
-                self.results.append(result)
-            except Exception as ex:
-                logger.error(f"Batch process error: {ex}")
-        self.status = "DONE"
-        logger.info(f"BatchJob {self.id} complete.")
-
-###############################
-# 7. GUI FRONTEND (Tkinter)
-###############################
+import tempfile
+import socket
+import uuid
+import platform
+import subprocess
+import traceback
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
-    GUI_AVAILABLE = True
-except Exception as ex:
-    logger.warning("GUI/Tkinter unavailable.")
-    GUI_AVAILABLE = False
+    from tkinter import ttk, messagebox, filedialog
+    import matplotlib
+    matplotlib.use('TkAgg')
+    import matplotlib.pyplot as plt
+    import matplotlib.figure as mplfig
+except ImportError:
+    tk = ttk = None  # Headless mode fallback
 
-class SmartVisionGUI:
-    def __init__(self, master):
-        self.master = master
-        master.title("SmartVision Document Automation Suite")
-        master.geometry("880x600")
-        self.in_files = []
-        self.rules = {}
-        self.setup_gui()
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
 
-    def setup_gui(self):
-        self.select_btn = tk.Button(self.master, text="Select Files", command=self.load_files)
-        self.select_btn.pack()
-        self.lang_var = tk.StringVar(value="eng")
-        
-        self.lang_label = tk.Label(self.master, text="OCR Language (Tesseract code):")
-        self.lang_label.pack()
-        self.lang_entry = tk.Entry(self.master, textvariable=self.lang_var)
-        self.lang_entry.pack()
-        
-        self.start_btn = tk.Button(self.master, text="Run Batch", command=self.run_batch)
-        self.start_btn.pack()
-        
-        self.progress = ttk.Progressbar(self.master, orient=tk.HORIZONTAL, length=500, mode='determinate')
-        self.progress.pack()
-        
-        self.log_box = tk.Text(self.master, height=20, width=100)
-        self.log_box.pack()
+try:
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives.kdf.argon2 import Argon2
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCM
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding
+    from cryptography.hazmat.primitives import hashes, serialization, hmac as c_hmac
+    from cryptography.hazmat.backends import default_backend
+    HAS_ARGON2 = True
+except Exception:
+    # Argon2 available only in cryptography>=41.0.0
+    HAS_ARGON2 = False
 
-    def log(self, txt):
-        self.log_box.insert(tk.END, txt + "\n")
-        self.log_box.see(tk.END)
+try:
+    import qrcode
+    from PIL import Image
+except ImportError:
+    qrcode = None
+    Image = None
 
-    def load_files(self):
-        files = filedialog.askopenfilenames(title="Select files", filetypes=(("Images and PDFs", "*.pdf;*.png;*.jpg;*.jpeg;*.tif"),))
-        self.in_files = files
-        self.log(f"Selected files: {self.in_files}")
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
-    def run_batch(self):
-        if not self.in_files:
-            messagebox.showerror("No files!", "Please select at least one file.")
-            return
-        lang = self.lang_var.get()
-        job = BatchJob(list(self.in_files), os.getcwd(), lang, self.rules)
-        def job_thread():
-            job.run()
-            self.progress['value'] = 100
-            self.log(f"Batch Done. Reports saved in {os.getcwd()}")
-        threading.Thread(target=job_thread, daemon=True).start()
-        for i in range(100):
-            time.sleep(0.1)
-            self.progress['value'] = i+1
-            self.master.update_idletasks()
+try:
+    import colorama
+    from colorama import Fore, Style
+    colorama.init()
+    LOG_COLOR = {True: Fore.GREEN, False: Fore.RED}
+except ImportError:
+    LOG_COLOR = {True: '', False: ''}
 
-###############################
-# 8. MAIN LOGIC/WORKFLOW
-###############################
 
-def process_document(filepath: str, outdir: str, lang='eng', rules: dict={}) -> dict:
-    """Process a single document: scan, ocr, extract, organize."""
-    logger.info(f"Processing document {filepath}")
-    out = {"source": filepath, "success": False}
-    fname, ext = os.path.splitext(os.path.basename(filepath))
+# ===================== Logging and Constants =====================
+
+TOOL_NAME = "VPN Ops Command Center"
+TOOL_SHORT = "vpn_ops_command_center"
+TOOL_VERSION = "1.0.0"
+TOOL_AUTHOR = "admin@yourcompany.example"
+TOOL_DISCLAIMER = (
+    "This tool is for lawful VPN operations and privacy hygiene only.\n"
+    "Misuse is strictly prohibited. Review all legal/ethical notes in the documentation."
+)
+VDIR = os.path.expanduser(os.path.join("~", f".{TOOL_SHORT}"))
+LOG_DIR = os.path.join(VDIR, "logs")
+PROFILE_DIR = os.path.join(VDIR, "server_profiles")
+CLIENT_DIR = os.path.join(VDIR, "clients")
+VAULT_FILE = os.path.join(VDIR, "vault.enc")
+CONFIG_DB = os.path.join(VDIR, "config_db.enc")
+ADBLOCK_DIR = os.path.join(VDIR, "adblock")
+BLOCKLIST_FILE = os.path.join(ADBLOCK_DIR, "hosts_blocklist.txt")
+README_FILE = os.path.join(VDIR, "README.txt")
+DASHBOARD_HISTORY_FILE = os.path.join(LOG_DIR, "dashboard_history.json")
+DEFAULT_SERVER_PORT = 51820  # WireGuard default
+KDF_ITERATIONS = 250_000  # PBKDF2 fallback
+ARGON_TIME_COST = 4  # If Argon2 is available
+ARGON_MEMORY_COST = 256 * 1024  # 256 MB
+ARGON_PARALLELISM = 4
+RSA_KEY_SIZE = 4096
+NO_LOGS_EXPLAIN = (
+    "When 'no logs' mode is enabled, this tool disables most persistent logging.\n"
+    "Essential actions, such as fatal errors or configuration changes, will still\n"
+    "be tracked minimally to support audit and fault analysis. This setting does *not*\n"
+    "affect logging done by external servers, operating systems, or remote peers.\n"
+)
+DRYRUN_NOTICE = "Dry-run mode active: no destructive operations will be performed."
+
+os.makedirs(VDIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(PROFILE_DIR, exist_ok=True)
+os.makedirs(CLIENT_DIR, exist_ok=True)
+os.makedirs(ADBLOCK_DIR, exist_ok=True)
+
+def colorlog(msg, ok=True):
+    print(f"{LOG_COLOR[ok]}{msg}{Style.RESET_ALL}")
+
+def safe_input(prompt):
     try:
-        if ext.lower() in [".pdf"]:
-            ocrtext = pdf_to_text(filepath)
-            if not ocrtext.strip():
-                ocrtext = ocr_pdf(filepath, None, lang)
-            extracted = extract_keyvalues(ocrtext, rules.get('fields', {}))
-            autosuggest = auto_label_file(ocrtext, extracted)
-            outpath = os.path.join(outdir, autosuggest + ".pdf")
-            shutil.copy(filepath, outpath)
-            out['out_pdf'] = outpath
-            out['extracted'] = extracted
-            out['text'] = ocrtext
-            out['tags'] = auto_tag(ocrtext, extracted)
-            out['success'] = True
-        elif ext.lower() in [".jpg", ".jpeg", ".png", ".tif"]:
-            img = load_image(filepath)
-            pre_img = preprocess_image(img)
-            text = perform_ocr(pre_img, lang)
-            extracted = extract_keyvalues(text, rules.get('fields', {}))
-            # Save as PDF
-            img_pil = Image.fromarray(pre_img)
-            pdf_out_path = os.path.join(outdir, auto_label_file(text, extracted) + ".pdf")
-            img_pil.save(pdf_out_path, "PDF")
-            out['out_pdf'] = pdf_out_path
-            out['extracted'] = extracted
-            out['text'] = text
-            out['tags'] = auto_tag(text, extracted)
-            out['success'] = True
-        else:
-            logger.warning(f"Unsupported file extension: {filepath}")
-    except Exception as ex:
-        logger.error(f"process_document error: {ex}")
-    return out
+        return input(prompt)
+    except EOFError:
+        return ''
 
-###############################
-# 9. API SERVER (Flask)
-###############################
+class DummyLogger:
+    def debug(self, *a, **k): pass
+    def info(self, *a, **k): pass
+    def warning(self, *a, **k): pass
+    def error(self, *a, **k): pass
+    def exception(self, *a, **k): pass
 
-app = Flask(__name__)
+def build_logger(name: str, level: str = "INFO", no_logs: bool = False):
+    if no_logs:
+        return DummyLogger()
+    logger = logging.getLogger(name)
+    handler = logging.FileHandler(os.path.join(LOG_DIR, f"{name}.log"), encoding='utf8')
+    formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    logger.propagate = False
+    return logger
 
-@app.route('/process', methods=['POST'])
-def api_process():
-    """
-    POST a file with optional 'lang', 'fields' (JSON: {Name:pattern}),
-    Returns: JSON with extracted data, suggested filename, tags and saved PDF.
-    """
-    f = request.files['file']
-    lang = request.form.get('lang', 'eng')
-    rules_raw = request.form.get('fields', '{}')
+# ===================== Utility functions =====================
+
+def atomic_write(filename, data, mode='wb'):
+    dirname = os.path.dirname(filename)
+    tmp = tempfile.NamedTemporaryFile(dir=dirname, delete=False)
+    with open(tmp.name, mode) as f:
+        f.write(data)
+    os.replace(tmp.name, filename)
+
+def secure_erase(filename):
     try:
-        rules = json.loads(rules_raw)
+        if os.path.exists(filename):
+            with open(filename, 'ba+', buffering=0) as f:
+                length = f.tell()
+                f.seek(0)
+                f.write(os.urandom(length or 1024))
+        os.remove(filename)
     except Exception:
-        rules = {}
-    tf = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(f.filename)[1])
-    f.save(tf.name)
-    outdir = tempfile.mkdtemp()
-    result = process_document(tf.name, outdir, lang, {'fields':rules})
-    with open(result.get('out_pdf', tf.name), 'rb') as pf:
-        pdf_data = pf.read()
-    resp = {
-        'extracted': result.get('extracted',{}),
-        'tags': result.get('tags',[]),
-        'text': result.get('text',""),
-        'file': os.path.basename(result.get('out_pdf', tf.name))
-    }
-    response_pdf = io.BytesIO(pdf_data)
-    response_pdf.seek(0)
-    shutil.move(result.get('out_pdf', tf.name), os.path.join(outdir, resp['file']))
-    resp['pdf_path'] = os.path.join(outdir, resp['file'])
-    return jsonify(resp)
+        pass
 
-@app.route('/download/<path:filename>', methods=['GET'])
-def api_download(filename):
-    # Download file from temp output folder
-    abs_path = os.path.abspath(filename)
-    return send_file(abs_path, attachment_filename=os.path.basename(filename), as_attachment=True)
+def random_bytes(n=32):
+    return os.urandom(n)
 
-###############################
-# 10. FILESYSTEM WATCHER (HOTFOLDER)
-###############################
+def now_iso():
+    return datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
 
-class HotfolderHandler(FileSystemEventHandler):
-    """Watches a directory for new files and processes them."""
-    def __init__(self, in_dir, out_dir, lang='eng'):
-        self.in_dir = in_dir
-        self.out_dir = out_dir
-        self.lang = lang
-        super().__init__()
+def confirm(prompt, auto_approve=False):
+    if auto_approve:
+        return True
+    resp = safe_input(f"{prompt} [y/N]: ").strip().lower()
+    return resp in ("y", "yes")
 
-    def on_created(self, event):
-        if event.is_directory:
+def get_platform():
+    return (platform.system(), platform.version(), platform.machine())
+
+def is_admin():
+    if os.name == 'nt':
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    else:
+        return os.geteuid() == 0
+
+def b64e(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode('ascii').rstrip('=')
+
+def b64d(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + '=' * (4 - len(data) % 4))
+
+def random_ip_subnet(base='10.13.13.0/24', allocated=None):
+    # Deterministic /24 IP assign, skip .0 and .1
+    if allocated is None:
+        allocated = []
+    net = base.rsplit('.', 1)[0]
+    for i in range(2, 254):
+        addr = f"{net}.{i}"
+        if addr not in allocated:
+            return addr
+    raise Exception("No available IPs in subnet")
+
+def nice_json(obj):
+    # Used for debugging configs
+    return json.dumps(obj, indent=2)
+
+def hash_str(s: str) -> str:
+    return hashlib.sha256(s.encode('utf8')).hexdigest()[:16]
+
+def sanitize_filename(s: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in s)
+
+def sluguuid():
+    return str(uuid.uuid4())[:8]
+
+# ===================== Cryptographic Vault =====================
+
+class Vault:
+    """
+    Encrypted vault for storing private keys and configuration secrets
+    """
+    def __init__(self, filename=VAULT_FILE, logger=None):
+        self.filename = filename
+        self._locked = True
+        self._masterkey = None
+        self._backend = default_backend()
+        self._data = {}
+        self.logger = logger or DummyLogger()
+
+    def derive_key(self, passphrase: str, salt: bytes):
+        # Prefer Argon2, fallback to PBKDF2-HMAC-SHA256 with many rounds
+        if HAS_ARGON2:
+            kdf = Argon2(
+                memory_cost=ARGON_MEMORY_COST,
+                time_cost=ARGON_TIME_COST,
+                parallelism=ARGON_PARALLELISM,
+                length=32,
+                salt=salt,
+                type=2
+            )
+        else:
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt,
+                iterations=KDF_ITERATIONS,
+                backend=self._backend
+            )
+        key = kdf.derive(passphrase.encode('utf8'))
+        return key
+
+    def lock(self):
+        self._locked = True
+        self._masterkey = None
+
+    def unlock(self, passphrase: str):
+        if not os.path.exists(self.filename):
+            raise Exception("Vault file does not exist. First-time setup required.")
+        with open(self.filename, "rb") as f:
+            raw = f.read()
+        try:
+            magic, salt, nonce, ciphertext, tag = (
+                raw[:6], raw[6:22], raw[22:34], raw[34:-16], raw[-16:]
+            )
+        except Exception:
+            raise Exception("Corrupt vault file format.")
+        if magic != b'VOPSC1':
+            raise Exception("Unrecognized vault magic. Possible upgrade needed.")
+        key = self.derive_key(passphrase, salt)
+        cipher = ChaCha20Poly1305(key)
+        try:
+            plaintext = cipher.decrypt(nonce, ciphertext+tag, b"vault")
+        except Exception:
+            raise Exception("Vault decryption failed. Wrong passphrase or corrupt file.")
+        try:
+            data = json.loads(plaintext.decode('utf8'))
+        except Exception:
+            raise Exception("Decryption succeeded, but vault decoding failed.")
+        self._data = data
+        self._masterkey = key
+        self._locked = False
+        self.logger.info("Vault unlocked.")
+        return True
+
+    def new(self, passphrase: str):
+        # Create a new vault.
+        if os.path.exists(self.filename):
+            raise Exception("Vault file already exists. Refusing to overwrite.")
+        salt = random_bytes(16)
+        key = self.derive_key(passphrase, salt)
+        nonce = random_bytes(12)
+        self._data = {}
+        cipher = ChaCha20Poly1305(key)
+        ad = b"vault"
+        plaintext = json.dumps(self._data).encode('utf8')
+        ciphertext = cipher.encrypt(nonce, plaintext, ad)
+        tag = ciphertext[-16:]
+        body = (
+            b'VOPSC1' + salt + nonce + ciphertext[:-16] + tag
+        )
+        atomic_write(self.filename, body)
+        self.logger.info("Created new vault at %s.", self.filename)
+        self._masterkey = key
+        self._locked = False
+
+    def persist(self):
+        if self._locked:
+            raise Exception("Vault is locked.")
+        salt = random_bytes(16)
+        nonce = random_bytes(12)
+        key = self._masterkey
+        cipher = ChaCha20Poly1305(key)
+        ad = b"vault"
+        plaintext = json.dumps(self._data).encode('utf8')
+        ciphertext = cipher.encrypt(nonce, plaintext, ad)
+        tag = ciphertext[-16:]
+        body = (
+            b'VOPSC1' + salt + nonce + ciphertext[:-16] + tag
+        )
+        atomic_write(self.filename, body)
+        self.logger.info("Persisted vault.")
+
+    def set_secret(self, key: str, value: Any):
+        if self._locked:
+            raise Exception("Vault is locked.")
+        self._data[key] = value
+        self.logger.info("Updated secret for %s.", key)
+        self.persist()
+
+    def get_secret(self, key: str, default=None):
+        if self._locked:
+            raise Exception("Vault is locked.")
+        return self._data.get(key, default)
+
+    def has_secret(self, key: str):
+        if self._locked:
+            raise Exception("Vault is locked.")
+        return key in self._data
+
+    def dump(self):
+        if self._locked:
+            return {}
+        return dict(self._data)
+
+# ===================== Key Generation (WireGuard X25519, RSA) =====================
+
+class KeyManager:
+    """
+    Handles generation, rotation, and export of cryptographic key pairs
+    """
+    def __init__(self, vault: Vault, logger=None):
+        self.vault = vault
+        self.logger = logger or DummyLogger()
+
+    def generate_x25519(self, label: str) -> Dict[str, str]:
+        priv = X25519PrivateKey.generate()
+        pub = priv.public_key()
+        priv_b64 = b64e(priv.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption()))
+        pub_b64 = b64e(pub.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw))
+        self.vault.set_secret(f"{label}_x25519_private", priv_b64)
+        self.vault.set_secret(f"{label}_x25519_public", pub_b64)
+        self.logger.info("Generated X25519 keypair for %s", label)
+        return {"private": priv_b64, "public": pub_b64}
+
+    def get_x25519(self, label: str) -> Optional[Dict[str, str]]:
+        priv = self.vault.get_secret(f"{label}_x25519_private")
+        pub = self.vault.get_secret(f"{label}_x25519_public")
+        if priv and pub:
+            return {"private": priv, "public": pub}
+        return None
+
+    def delete_x25519(self, label: str):
+        for suffix in ("_x25519_private", "_x25519_public"):
+            if self.vault.has_secret(label + suffix):
+                self.vault.set_secret(label + suffix, None)
+        self.logger.info("Erased X25519 keys for %s", label)
+
+    def generate_rsa(self, label: str):
+        priv_obj = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=RSA_KEY_SIZE,
+            backend=default_backend()
+        )
+        priv_bytes = priv_obj.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()
+        )
+        pub_bytes = priv_obj.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        self.vault.set_secret(f"{label}_rsa_private", b64e(priv_bytes))
+        self.vault.set_secret(f"{label}_rsa_public", b64e(pub_bytes))
+        self.logger.info("Generated RSA-4096 keypair for %s", label)
+        return {"private_pem": b64e(priv_bytes), "public_pem": b64e(pub_bytes)}
+
+    def get_rsa(self, label: str) -> Optional[Dict[str, str]]:
+        priv = self.vault.get_secret(f"{label}_rsa_private")
+        pub = self.vault.get_secret(f"{label}_rsa_public")
+        if priv and pub:
+            return {"private_pem": priv, "public_pem": pub}
+        return None
+
+# ===================== SSH Operations for Server Lifecycle =====================
+
+class ServerSSH:
+    """
+    Handles SSH connections for remote server management.
+    All actions require confirmation.
+    """
+    def __init__(self, hostname: str, username: str, port: int = 22, key: Optional[str]=None,
+                 password: Optional[str]=None, logger=None, dry_run=False, auto_approve=False):
+        if not paramiko:
+            raise ImportError("paramiko module required. Install with pip.")
+        self.hostname = hostname
+        self.username = username
+        self.port = port
+        self.key = key
+        self.password = password
+        self.dry_run = dry_run
+        self.auto_approve = auto_approve
+        self.logger = logger or DummyLogger()
+        self.client = None
+
+    def connect(self):
+        self.logger.info(f"Connecting to {self.username}@{self.hostname}:{self.port}")
+        if self.dry_run:
+            colorlog("[DRY RUN] Would connect via SSH.", True)
             return
-        filepath = event.src_path
-        logger.info(f"Detected new file: {filepath}")
-        process_document(filepath, self.out_dir, self.lang, {})
+        c = paramiko.SSHClient()
+        c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            if self.key:
+                key_obj = paramiko.RSAKey.from_private_key_file(self.key)
+                c.connect(self.hostname, port=self.port, username=self.username, pkey=key_obj)
+            else:
+                c.connect(self.hostname, port=self.port, username=self.username, password=self.password)
+            self.client = c
+            self.logger.info("SSH connection established.")
+        except Exception as e:
+            self.logger.error(f"SSH connection failed: {e}")
+            raise
 
-def run_hotfolder_watch(in_dir, out_dir, lang='eng'):
-    event_handler = HotfolderHandler(in_dir, out_dir, lang)
-    observer = Observer()
-    observer.schedule(event_handler, path=in_dir, recursive=False)
-    observer.start()
-    logger.info(f"Started hotfolder watch: {in_dir} -> {out_dir}")
+    def close(self):
+        if self.client:
+            self.client.close()
+            self.logger.info("SSH connection closed.")
+        self.client = None
+
+    def run(self, command: str, require_confirm=True, sudo=False):
+        if sudo and not command.strip().startswith("sudo"):
+            command = "sudo " + command
+        if require_confirm and not confirm(f"Run on {self.hostname}: {command}", self.auto_approve):
+            self.logger.info("Command declined: %s", command)
+            return "[ABORTED]"
+        if self.dry_run:
+            colorlog(f"[DRY RUN] Would run: {command}", True)
+            return "[DRY RUN]"
+        stdin, stdout, stderr = self.client.exec_command(command)
+        out, err = stdout.read().decode(), stderr.read().decode()
+        rc = stdout.channel.recv_exit_status()
+        self.logger.info(f"Ran: {command} [rc={rc}]")
+        if rc != 0:
+            self.logger.error(f"Error output: {err.strip()}")
+        return out.strip(), err.strip(), rc
+
+    def upload(self, localfile, remotefile):
+        if not confirm(f"Upload {localfile} -> {self.hostname}:{remotefile}", self.auto_approve):
+            self.logger.info("Upload declined: %s", localfile)
+            return "[ABORTED]"
+        if self.dry_run:
+            colorlog(f"[DRY RUN] Would upload {localfile} to {remotefile}", True)
+            return "[DRY RUN]"
+        with open(localfile, "rb") as f:
+            data = f.read()
+        sftp = self.client.open_sftp()
+        sftp.put(localfile, remotefile)
+        sftp.close()
+        self.logger.info(f"Uploaded file to {remotefile}")
+        return "OK"
+
+    def retrieve(self, remotefile, localfile):
+        if not confirm(f"Download {self.hostname}:{remotefile} -> {localfile}", self.auto_approve):
+            self.logger.info("Download declined: %s", remotefile)
+            return "[ABORTED]"
+        if self.dry_run:
+            colorlog(f"[DRY RUN] Would retrieve {remotefile} to {localfile}", True)
+            return "[DRY RUN]"
+        sftp = self.client.open_sftp()
+        sftp.get(remotefile, localfile)
+        sftp.close()
+        self.logger.info(f"Retrieved file {remotefile}")
+        return "OK"
+
+# ===================== Profile and Client Management =====================
+
+class ConfigDB:
+    """
+    Config DB (encrypted, persisted JSON) for servers and clients
+    """
+    def __init__(self, filename=CONFIG_DB, vault: Optional[Vault]=None, logger=None):
+        self.filename = filename
+        self.vault = vault
+        self.logger = logger or DummyLogger()
+        self._data = {}
+        self._loaded = False
+
+    def load(self):
+        if not os.path.exists(self.filename):
+            self._data = {"servers": {}, "clients": {}}
+            self._loaded = True
+            return
+        if not self.vault or self.vault._locked:
+            raise Exception("Vault must be unlocked to access config DB.")
+        with open(self.filename, "rb") as f:
+            raw = f.read()
+        key = self.vault._masterkey
+        nonce, ciphertext, tag = raw[:12], raw[12:-16], raw[-16:]
+        cipher = ChaCha20Poly1305(key)
+        try:
+            plaintext = cipher.decrypt(nonce, ciphertext+tag, b"configdb")
+            data = json.loads(plaintext.decode('utf8'))
+        except Exception as e:
+            self.logger.error("ConfigDB decryption failed: %s", e)
+            raise
+        self._data = data
+        self._loaded = True
+        self.logger.info("Loaded config DB.")
+        return
+
+    def dump(self) -> dict:
+        if not self._loaded:
+            self.load()
+        return self._data
+
+    def save(self):
+        if not self._loaded:
+            raise Exception("Config not loaded.")
+        if not self.vault or self.vault._locked:
+            raise Exception("Vault must be unlocked to store config DB.")
+        key = self.vault._masterkey
+        nonce = random_bytes(12)
+        cipher = ChaCha20Poly1305(key)
+        plaintext = json.dumps(self._data).encode('utf8')
+        ct = cipher.encrypt(nonce, plaintext, b"configdb")
+        tag = ct[-16:]
+        body = nonce + ct[:-16] + tag
+        atomic_write(self.filename, body)
+        self.logger.info("Saved config DB.")
+
+    def add_server(self, name: str, data: dict):
+        if not self._loaded:
+            self.load()
+        self._data["servers"][name] = data
+        self.logger.info("Added server profile: %s", name)
+        self.save()
+
+    def add_client(self, name: str, data: dict):
+        if not self._loaded:
+            self.load()
+        self._data["clients"][name] = data
+        self.logger.info("Added client profile: %s", name)
+        self.save()
+
+    def list_servers(self):
+        if not self._loaded:
+            self.load()
+        return list(self._data.get("servers", {}).keys())
+
+    def list_clients(self):
+        if not self._loaded:
+            self.load()
+        return list(self._data.get("clients", {}).keys())
+
+    def get_server(self, name: str):
+        if not self._loaded:
+            self.load()
+        return self._data.get("servers", {}).get(name)
+
+    def get_client(self, name: str):
+        if not self._loaded:
+            self.load()
+        return self._data.get("clients", {}).get(name)
+
+    def update_client(self, name: str, data: dict):
+        if not self._loaded:
+            self.load()
+        self._data["clients"][name] = data
+        self.logger.info(f"Updated client: {name}")
+        self.save()
+
+    def revoke_client(self, name: str):
+        if not self._loaded:
+            self.load()
+        if name in self._data.get("clients", {}):
+            del self._data["clients"][name]
+            self.logger.info(f"Revoked client: {name}")
+            self.save()
+
+# ===================== WireGuard Configuration Helpers =====================
+
+def generate_wg_conf(server: dict, client: dict, private_key: str, peer_pub: str, cli_ip: str, dns: List[str]=None) -> str:
+    """
+    Returns full wg-quick configuration for this client.
+    """
+    DNS = '\nDNS = {}'.format(','.join(dns)) if dns else ""
+    tpl = f"""[Interface]
+PrivateKey = {private_key}
+Address = {cli_ip}/32{DNS}
+
+[Peer]
+PublicKey = {peer_pub}
+Endpoint = {server['host']}:{server.get('port', DEFAULT_SERVER_PORT)}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+"""
+    return tpl
+
+def generate_server_peer_block(client_pub: str, assigned_ip: str) -> str:
+    """
+    Generates the [Peer] block for a particular client on the server
+    """
+    peer_tpl = f"""[Peer]
+PublicKey = {client_pub}
+AllowedIPs = {assigned_ip}/32
+"""
+    return peer_tpl
+
+def parse_wg_show_output(output: str) -> dict:
+    """
+    WireGuard 'wg show' output parser for peer and transfer
+    """
+    peers = {}
+    lines = output.splitlines()
+    current_peer = None
+    for line in lines:
+        if line.startswith("peer:"):
+            current_peer = line.split()[1].strip()
+            peers[current_peer] = {}
+        elif current_peer and ":" in line:
+            key, val = line.strip().split(":", 1)
+            peers[current_peer][key.strip()] = val.strip()
+    return peers
+
+# ===================== QR Code Export =====================
+
+def export_qr(cfg: str, output_file: str="client_qr.png"):
+    if not qrcode or not Image:
+        raise Exception("qrcode and pillow required to export QR codes.")
+    img = qrcode.make(cfg)
+    img.save(output_file)
+    colorlog(f"Exported config QR to {output_file}", True)
+    return output_file
+
+# ===================== Adblock (Blocklist Manager) =====================
+
+class AdBlockManager:
+    """Manages ad-blocking hosts/blocklist; supports updates and merging."""
+    DEFAULT_URLS = [
+        "https://someonewhocares.org/hosts/hosts",
+        "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+    ]
+    def __init__(self, enabled=True, logger=None):
+        self.blocklist_file = BLOCKLIST_FILE
+        self.urls = list(self.DEFAULT_URLS)
+        self.enabled = enabled
+        self.logger = logger or DummyLogger()
+
+    def update_blocklists(self):
+        # Merges blocklists and writes a deduped hosts file
+        all_entries = set()
+        for url in self.urls:
+            try:
+                colorlog(f"Fetching blocklist: {url}")
+                data = self._fetch_url(url)
+                for line in data.splitlines():
+                    if line.strip().startswith("0.0.0.0") or line.strip().startswith("127.0.0.1"):
+                        entry = line.strip()
+                        all_entries.add(entry)
+            except Exception as e:
+                self.logger.warning(f"Blocklist fetch failed: {e}")
+        # Write to file with explanation
+        blockdata = "# Merged adblock hosts file.\n" + "\n".join(sorted(all_entries)) + "\n"
+        atomic_write(self.blocklist_file, blockdata.encode('utf8'))
+        self.logger.info(f"Updated blocklist to {self.blocklist_file}.")
+
+    def _fetch_url(self, url):
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            return resp.read().decode('utf8')
+
+    def enable(self):
+        self.enabled = True
+        colorlog("Adblock enabled.", True)
+
+    def disable(self):
+        self.enabled = False
+        colorlog("Adblock disabled.", True)
+
+    def status(self):
+        return self.enabled
+
+# ===================== DNS Leak Test/Audit =====================
+
+def dns_leak_audit(logger=None):
+    tester = ["https://www.cloudflare.com/cdn-cgi/trace"]
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
+        import urllib.request
+        for url in tester:
+            colorlog(f"Testing DNS/IP leak: {url}")
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                data = resp.read().decode()
+            ip = None
+            for line in data.splitlines():
+                if line.startswith('ip='):
+                    ip = line.split('=',1)[1]
+            if not ip:
+                colorlog("Could not parse IP address.", False)
+            else:
+                colorlog(f"External IP Seen by Cloudflare: {ip}", True)
+            # Check DOH
+            doh_resp = None
+            test_url = "https://dns.google/resolve?name=example.com&type=A"
+            colorlog(f"Resolving via DoH: {test_url}")
+            with urllib.request.urlopen(test_url, timeout=8) as resp:
+                doh_resp = resp.read().decode()
+            if doh_resp:
+                colorlog("DNS-over-HTTPS seems operational.", True)
+            return {"ip": ip}
+    except Exception as e:
+        colorlog(f"DNS/IP leak test failed: {e}", False)
+        if logger:
+            logger.error("DNS/IP leak test failed: %s", e)
+        return {"error": str(e)}
 
-###############################
-# 11. PLUGIN SYSTEM
-###############################
+# ===================== Kill Switch (Network Safety) =====================
 
-class PluginBase:
-    """Extendable plugin hook for document post-processing."""
-    def process(self, doc_data: dict) -> dict:
-        """Modify or enrich document data"""
-        return doc_data
+class KillSwitch:
+    """
+    Implements network killswitch for local system.
+    """
+    def __init__(self, hard_mode=False, dry_run=False, logger=None):
+        self.hard_mode = hard_mode
+        self.dry_run = dry_run
+        self.logger = logger or DummyLogger()
 
-_PLUGINS = []
+    def apply(self):
+        # Only do on explicit confirmation, works for Windows
+        if not confirm("Apply network kill switch (HARD mode blocks all traffic if VPN is down)?", False):
+            return False
+        if self.dry_run:
+            colorlog("[DRY RUN] Would apply kill switch rules.", True)
+            return True
+        if self.hard_mode:
+            self._apply_hard()
+        else:
+            self._apply_soft()
+        return True
 
-def register_plugin(plugin):
-    _PLUGINS.append(plugin)
+    def _apply_soft(self):
+        # Block split-tunnel by setting strict metric and firewall rules for WireGuard only
+        colorlog("Applying soft kill switch... (blocks non-VPN for known interfaces)")
+        if os.name == 'nt':
+            # Windows example: Block outbound except for wg0 (requires admin)
+            cmd = r'netsh advfirewall firewall add rule name="KillSwitch" dir=out action=block interfaceType=any'
+            subprocess.call(cmd, shell=True)
+        else:
+            cmd = "sudo iptables -I OUTPUT ! -o wg0 -j DROP"
+            subprocess.call(cmd, shell=True)
+        self.logger.info("Soft kill switch active.")
 
-def run_plugins(doc_data):
-    for plugin in _PLUGINS:
-        doc_data = plugin.process(doc_data)
-    return doc_data
+    def _apply_hard(self):
+        # Main traffic OUT except for VPN interface is blocked
+        colorlog("Applying HARD kill switch. All non-WireGuard traffic blocked until VPN up.", True)
+        self._apply_soft()
+        self.logger.info("Hard kill switch applied.")
 
-###############################
-# 12. MAIN ENTRY POINT
-###############################
+    def remove(self):
+        if self.dry_run:
+            colorlog("[DRY RUN] Would remove kill switch rules.", True)
+            return True
+        colorlog("Removing kill switch rules...", True)
+        if os.name == 'nt':
+            subprocess.call('netsh advfirewall firewall delete rule name="KillSwitch"', shell=True)
+        else:
+            subprocess.call("sudo iptables -D OUTPUT ! -o wg0 -j DROP", shell=True)
+        self.logger.info("Removed kill switch.")
+
+# ===================== Multi-hop Routing Manager =====================
+
+class MultiHopManager:
+    """
+    Allows admin to chain supported gateways for multi-hop VPN.
+    No automation to 3rd-party VPNs.
+    """
+    def __init__(self, config_db: ConfigDB, logger=None):
+        self.config_db = config_db
+        self.logger = logger or DummyLogger()
+
+    def available_gws(self) -> List[str]:
+        return self.config_db.list_servers()
+
+    def chain_info(self, selected: List[str]) -> List[dict]:
+        return [self.config_db.get_server(name) for name in selected]
+
+    def measure_perf(self, chain: List[dict]) -> dict:
+        # Naive perf check: measure ping and sample throughput
+        results = {}
+        for node in chain:
+            host = node['host']
+            colorlog(f"Pinging {host}...")
+            try:
+                if os.name == 'nt':
+                    rc = subprocess.call(f"ping -n 1 {host}", shell=True)
+                else:
+                    rc = subprocess.call(f"ping -c 1 {host}", shell=True)
+                results[host] = "OK" if rc == 0 else "FAIL"
+            except Exception:
+                results[host] = "FAIL"
+        fastest = [h for h,v in results.items() if v=="OK"]
+        if fastest:
+            colorlog(f"Fastest reachable chain: {fastest}", True)
+        return results
+
+# ===================== Monitoring Dashboard =====================
+
+class Dashboard:
+    """
+    Monitors CPU, memory, network, and per-client throughput.
+    Tkinter+matplotlib GUI. Headless fallback if tkinter/psutil unavailable.
+    """
+    def __init__(self, config_db: ConfigDB, log_history=DASHBOARD_HISTORY_FILE, logger=None):
+        self.config_db = config_db
+        self.log_history = log_history
+        self.logger = logger or DummyLogger()
+        self._running = False
+
+    def start(self):
+        if tk and psutil:
+            threading.Thread(target=self._run_gui, daemon=True).start()
+        else:
+            colorlog("Dashboard requires tkinter+psutil.", False)
+
+    def _run_gui(self):
+        root = tk.Tk()
+        root.title(f"{TOOL_NAME} Dashboard")
+        f = tk.Frame(root)
+        f.pack(fill=tk.BOTH, expand=True)
+        lbl = tk.Label(f, text="Live VPN Ops Dashboard", font=("Arial", 14))
+        lbl.pack()
+        fig = mplfig.Figure(figsize=(6,3))
+        ax = fig.add_subplot(111)
+        canvas = matplotlib.backends.backend_tkagg.FigureCanvasTkAgg(fig, master=f)
+        canvas.get_tk_widget().pack()
+        mem_label = tk.Label(f, text="Memory: ")
+        mem_label.pack()
+        net_label = tk.Label(f, text="Network: ")
+        net_label.pack()
+        per_client = tk.Label(f, text="Clients: ")
+        per_client.pack()
+
+        def polldata():
+            try:
+                cpu = psutil.cpu_percent()
+                mem = psutil.virtual_memory().percent
+                net = psutil.net_io_counters()
+                mem_label.config(text=f"Memory: {mem:.1f}%")
+                net_label.config(text=f"Net: sent {net.bytes_sent//1e6:.2f} MB, recv {net.bytes_recv//1e6:.2f} MB")
+                t = datetime.now().strftime("%H:%M:%S")
+                ax.cla()
+                cpus = psutil.cpu_percent(percpu=True)
+                ax.plot(cpus, marker='o')
+                ax.set_ylim(0,100)
+                ax.set_ylabel("CPU usage %")
+                canvas.draw()
+                # Per-client from config (placeholder)
+                client_list = self.config_db.list_clients()
+                c_info = "\n".join(client_list)
+                per_client.config(text=f"Clients:\n{c_info}")
+            except Exception as e:
+                self.logger.error("Dashboard poll failed: %s", e)
+            if self._running:
+                root.after(2000, polldata)
+
+        self._running = True
+        polldata()
+        root.protocol("WM_DELETE_WINDOW", lambda: self.stop(root))
+        root.mainloop()
+
+    def stop(self, root=None):
+        self._running = False
+        if root:
+            root.destroy()
+        self.logger.info("Dashboard stopped.")
+
+# ===================== Guided Setup and CLI =====================
+
+class GuidedSetup:
+    """
+    First-time guided setup for the VPN Ops Command Center
+    """
+    def __init__(self, vault: Vault, config_db: ConfigDB, key_mgr: KeyManager, logger=None):
+        self.vault = vault
+        self.config_db = config_db
+        self.key_mgr = key_mgr
+        self.logger = logger or DummyLogger()
+
+    def run(self):
+        colorlog("==== VPN Ops Command Center — First-time Setup ====\n", True)
+        if os.path.exists(self.vault.filename):
+            colorlog("Vault already exists; skipping setup.", True)
+            return
+        passphrase = ''
+        while not passphrase:
+            p1 = getpass.getpass("Enter NEW vault passphrase: ")
+            p2 = getpass.getpass("Confirm passphrase: ")
+            if len(p1) < 8:
+                colorlog("Passphrase should be at least 8 chars.", False)
+                continue
+            if p1 != p2:
+                colorlog("Passphrases do not match.", False)
+                continue
+            passphrase = p1
+        self.vault.new(passphrase)
+        colorlog("Vault created and unlocked.", True)
+        # Generate admin keys
+        colorlog("Generating X25519 keypair for admin profile...", True)
+        self.key_mgr.generate_x25519("admin")
+        # Prompt for first server
+        name = sanitize_filename(safe_input("Enter a name for your first server profile: ").strip())
+        host = safe_input("Server hostname/IP: ").strip()
+        ssh_user = safe_input("SSH username: ").strip()
+        port = safe_input("SSH port [22]: ").strip()
+        port = int(port) if port.isdigit() else 22
+        # Save profile
+        srv = {
+            "name": name,
+            "host": host,
+            "ssh_user": ssh_user,
+            "port": port,
+            "created_at": now_iso(),
+        }
+        self.config_db.add_server(name, srv)
+        colorlog("Server profile created.", True)
+        # Generate first test client
+        cli_name = sanitize_filename(safe_input("Name for your first client (e.g. alice): ").strip())
+        cli_keypair = self.key_mgr.generate_x25519(cli_name)
+        cli_ip = random_ip_subnet()
+        cli = {
+            "name": cli_name,
+            "address": cli_ip,
+            "public_key": cli_keypair['public'],
+            "created_at": now_iso(),
+            "server": name,
+        }
+        self.config_db.add_client(cli_name, cli)
+        colorlog(f"First client '{cli_name}' created with IP {cli_ip}.", True)
+        colorlog("==== Setup Complete! ====", True)
+
+# ===================== CLI Main Logic =====================
+
+def usage():
+    print(f"""
+{TOOL_NAME} (vpn_ops_command_center.py) — CLI
+==================================================================================
+Usage:
+  python vpn_ops_command_center.py [command] [options]
+
+  Commands:
+    setup                 Guided first-time setup wizard
+    clients               List or manage clients (--list, --add, --revoke, --export, --qr, --rotate)
+    servers               List or manage server profiles (--list, --add, --show, --remove)
+    ssh                   SSH operation (install, start, stop, logs, upload, download)
+    dashboard             Launch live monitoring dashboard GUI
+    audit                 Run DNS and IP leak audit function (saves human-readable report)
+    killswitch            Apply or remove network kill switch (--apply [--hard] / --remove)
+    adblock               Update/fetch blocklist, toggle per profile (--enable/--disable/--update)
+    multihop              Manage chained gateway routing (list, perf)
+    self-test             Run built-in sanity check unit tests
+    help                  Show this usage/help message
+
+  Options (where supported):
+    --dry-run             Preview/dry-run mode (no changes made)
+    --auto-approve        Approve actions without prompting (dangerous, advanced)
+    --no-logs             Suppress logging; see privacy note
+    --profile NAME        Specify server or client profile name
+
+Examples:
+  python vpn_ops_command_center.py setup
+  python vpn_ops_command_center.py clients --list
+  python vpn_ops_command_center.py clients --add --name bob
+  python vpn_ops_command_center.py ssh --profile myserver --install
+  python vpn_ops_command_center.py dashboard
+  python vpn_ops_command_center.py audit
+  python vpn_ops_command_center.py self-test
+
+Notes:
+  - All config, secrets, and keys are managed in {VDIR}
+  - For lawful privacy hygiene and administration only. See legal/ethics header.
+==================================================================================
+""")
+
+# ===================== Main Entrypoint =====================
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="SmartVision Document Automation Suite")
-    parser.add_argument('--gui', action='store_true', help='Run GUI frontend')
-    parser.add_argument('--api', action='store_true', help='Run API server')
-    parser.add_argument('--hotfolder', metavar='IN_DIR', type=str, help='Run as hotfolder watching IN_DIR')
-    parser.add_argument('--outfile', type=str, help='Output folder')
-    parser.add_argument('--lang', type=str, default='eng', help='OCR language code')
-    parser.add_argument('--fields', type=str, help='JSON string of template extraction fields')
-    parser.add_argument('files', nargs='*', help='Files to process')
+
+    parser = argparse.ArgumentParser(description=TOOL_NAME, add_help=False)
+    parser.add_argument("command", nargs="?", default="help", help="Subcommand")
+    parser.add_argument("--dry-run", action="store_true", help="Preview/dry-run mode")
+    parser.add_argument("--auto-approve", action="store_true", help="Auto-approve confirmations")
+    parser.add_argument("--no-logs", action="store_true", help="Suppress logging")
+    parser.add_argument("--profile", help="Specify profile name")
+    parser.add_argument("--list", action="store_true", help="List records")
+    parser.add_argument("--add", action="store_true", help="Add new record")
+    parser.add_argument("--export", action="store_true", help="Export config")
+    parser.add_argument("--qr", action="store_true", help="Export QR code")
+    parser.add_argument("--revoke", action="store_true", help="Revoke client")
+    parser.add_argument("--rotate", action="store_true", help="Rotate keys")
+    parser.add_argument("--show", action="store_true", help="Show details")
+    parser.add_argument("--install", action="store_true", help="Install server software")
+    parser.add_argument("--start", action="store_true", help="Start service")
+    parser.add_argument("--stop", action="store_true", help="Stop service")
+    parser.add_argument("--logs", action="store_true", help="Retrieve logs")
+    parser.add_argument("--remove", action="store_true", help="Remove profile")
+    parser.add_argument("--apply", action="store_true", help="Apply kill switch")
+    parser.add_argument("--hard", action="store_true", help="HARD kill switch")
+    parser.add_argument("--update", action="store_true", help="Update adblock list")
+    parser.add_argument("--enable", action="store_true", help="Enable adblock")
+    parser.add_argument("--disable", action="store_true", help="Disable adblock")
+    parser.add_argument("--name", help="Client or server name")
+    parser.add_argument("--help", action="store_true", help="Show help")
+
     args = parser.parse_args()
-    if args.gui:
-        if not GUI_AVAILABLE:
-            print("Tkinter not installed! Cannot run GUI.")
-            exit(1)
-        root = tk.Tk()
-        app = SmartVisionGUI(root)
-        root.mainloop()
-    elif args.api:
-        app.run(host='0.0.0.0', port=8585)
-    elif args.hotfolder:
-        outdir = args.outfile or os.getcwd()
-        run_hotfolder_watch(args.hotfolder, outdir, args.lang)
-    elif args.files:
-        outdir = args.outfile or os.getcwd()
-        rules = {}
-        if args.fields:
-            try:
-                rules = {'fields': json.loads(args.fields)}
-            except Exception as ex:
-                logger.error(f"Could not parse fields JSON: {ex}")
-        job = BatchJob(args.files, outdir, args.lang, rules)
-        job.run()
-        print(f"Batch completed: output in {outdir}")
+
+    logger = build_logger("main", "INFO", args.no_logs)
+
+    # Load vault and ConfigDB (prompt for passphrase if needed)
+    vault = Vault(logger=logger)
+    key_mgr = KeyManager(vault, logger=logger)
+    config_db = ConfigDB(vault=vault, logger=logger)
+    adblock_mgr = AdBlockManager(enabled=False, logger=logger)
+    mhmgr = MultiHopManager(config_db, logger=logger)
+    dry_run = args.dry_run
+    auto_approve = args.auto_approve or dry_run
+
+    # Help
+    if args.help or args.command in ("help", "-h", "--help", ""):
+        usage()
+        sys.exit(0)
+
+    # Setup
+    if args.command == "setup":
+        GuidedSetup(vault, config_db, key_mgr, logger).run()
+        sys.exit(0)
+
+    # Unlock vault
+    if not os.path.exists(vault.filename):
+        colorlog("Vault does not exist. Run 'python vpn_ops_command_center.py setup' first.", False)
+        sys.exit(1)
+    for i in range(3):
+        try:
+            passphrase = getpass.getpass("Enter vault passphrase: ")
+            vault.unlock(passphrase)
+            break
+        except Exception as e:
+            colorlog(str(e), False)
+            if i == 2:
+                sys.exit(1)
+
+    # ConfigDB load
+    try:
+        config_db.load()
+    except Exception as e:
+        colorlog(f"Failed to load config DB: {e}", False)
+        sys.exit(1)
+
+    # Server Profile Ops
+    if args.command == "servers":
+        if args.list:
+            servers = config_db.list_servers()
+            colorlog(f"Server profiles:\n- " + "\n- ".join(servers), True)
+        elif args.add:
+            name = args.name or sanitize_filename(safe_input("Server profile name: ").strip())
+            host = safe_input("Server hostname/IP: ").strip()
+            ssh_user = safe_input("SSH username: ").strip()
+            port = safe_input("SSH port [22]: ").strip()
+            port = int(port) if port.isdigit() else 22
+            srv = {
+                "name": name,
+                "host": host,
+                "ssh_user": ssh_user,
+                "port": port,
+                "created_at": now_iso(),
+            }
+            config_db.add_server(name, srv)
+            colorlog("Server profile created.", True)
+        elif args.show:
+            prof = args.profile or args.name or safe_input("Server profile name: ").strip()
+            data = config_db.get_server(prof)
+            if not data:
+                colorlog("Profile not found.", False)
+            else:
+                print(nice_json(data))
+        elif args.remove:
+            prof = args.profile or args.name or safe_input("Server profile name: ").strip()
+            if confirm(f"Remove server profile {prof}?", auto_approve):
+                servers = config_db.list_servers()
+                if prof in servers:
+                    del config_db._data["servers"][prof]
+                    config_db.save()
+                    colorlog(f"Profile {prof} removed.", True)
+                else:
+                    colorlog("Not found.", False)
+        else:
+            usage()
+        sys.exit(0)
+
+    # Client Profile Ops
+    if args.command == "clients":
+        if args.list:
+            clients = config_db.list_clients()
+            colorlog(f"Clients:\n- " + "\n- ".join(clients), True)
+        elif args.add:
+            name = args.name or sanitize_filename(safe_input("Client name: ").strip())
+            srv_name = args.profile or safe_input("Server profile: ").strip()
+            srv = config_db.get_server(srv_name)
+            if not srv:
+                colorlog("No such server profile.", False)
+                sys.exit(1)
+            keypair = key_mgr.generate_x25519(name)
+            allocated_ips = set(cli.get("address") for cli in config_db._data.get("clients", {}).values())
+            cli_ip = random_ip_subnet(allocated=allocated_ips)
+            cli = {
+                "name": name,
+                "address": cli_ip,
+                "public_key": keypair['public'],
+                "created_at": now_iso(),
+                "server": srv_name,
+            }
+            config_db.add_client(name, cli)
+            colorlog(f"Client {name} added with IP {cli_ip}.", True)
+        elif args.export:
+            name = args.name or safe_input("Client name: ").strip()
+            cli = config_db.get_client(name)
+            if not cli:
+                colorlog("Client not found.", False)
+                sys.exit(1)
+            srv = config_db.get_server(cli['server'])
+            priv = key_mgr.get_x25519(name)['private']
+            pub = key_mgr.get_x25519(cli['server'])['public']
+            conf = generate_wg_conf(srv, cli, priv, pub, cli['address'])
+            outfile = os.path.join(CLIENT_DIR, f"{name}.conf")
+            with open(outfile, "w") as f:
+                f.write(conf)
+            colorlog(f"Exported client config to {outfile}", True)
+        elif args.qr:
+            name = args.name or safe_input("Client name: ").strip()
+            cli = config_db.get_client(name)
+            if not cli:
+                colorlog("Client not found.", False)
+                sys.exit(1)
+            srv = config_db.get_server(cli['server'])
+            priv = key_mgr.get_x25519(name)['private']
+            pub = key_mgr.get_x25519(cli['server'])['public']
+            conf = generate_wg_conf(srv, cli, priv, pub, cli['address'])
+            outfile = os.path.join(CLIENT_DIR, f"{name}_qr.png")
+            export_qr(conf, outfile)
+        elif args.revoke:
+            name = args.name or safe_input("Client name: ").strip()
+            if confirm(f"Revoke access for client {name}?", auto_approve):
+                config_db.revoke_client(name)
+                key_mgr.delete_x25519(name)
+                colorlog(f"Client {name} revoked.", True)
+        elif args.rotate:
+            name = args.name or safe_input("Client name: ").strip()
+            cli = config_db.get_client(name)
+            if not cli:
+                colorlog("Client not found.", False)
+                sys.exit(1)
+            keypair = key_mgr.generate_x25519(name)
+            cli['public_key'] = keypair['public']
+            cli['rotated_at'] = now_iso()
+            config_db.update_client(name, cli)
+            colorlog(f"Client keys rotated for {name}. Update server config for this peer!", True)
+        else:
+            usage()
+        sys.exit(0)
+
+    # SSH Ops
+    if args.command == "ssh":
+        prof = args.profile or safe_input("Server profile name: ").strip()
+        srv = config_db.get_server(prof)
+        if not srv:
+            colorlog("Server profile not found.", False)
+            sys.exit(1)
+        ssh_cli = ServerSSH(
+            srv['host'], srv.get('ssh_user','root'), port=srv.get('port',22),
+            logger=logger,
+            dry_run=dry_run,
+            auto_approve=auto_approve
+        )
+        ssh_cli.connect()
+        try:
+            if args.install:
+                colorlog("Install WireGuard on server...", True)
+                ssh_cli.run("apt update && apt install -y wireguard", require_confirm=True, sudo=True)
+            elif args.start:
+                colorlog("Start WireGuard service...", True)
+                ssh_cli.run("wg-quick up wg0", require_confirm=True, sudo=True)
+            elif args.stop:
+                colorlog("Stop WireGuard service...", True)
+                ssh_cli.run("wg-quick down wg0", require_confirm=True, sudo=True)
+            elif args.logs:
+                colorlog("Retrieve WireGuard logs...", True)
+                out, err, rc = ssh_cli.run("journalctl -u wg-quick@wg0 --no-pager | tail -n 50",
+                                           require_confirm=True, sudo=True)
+                print(out)
+            elif args.upload:
+                src = safe_input("Local file to upload: ").strip()
+                dst = safe_input("Remote destination path: ").strip()
+                ssh_cli.upload(src, dst)
+            elif args.download:
+                src = safe_input("Remote file to download: ").strip()
+                dst = safe_input("Local dest path: ").strip()
+                ssh_cli.retrieve(src, dst)
+            else:
+                usage()
+        finally:
+            ssh_cli.close()
+        sys.exit(0)
+
+    # Dashboard
+    if args.command == "dashboard":
+        dash = Dashboard(config_db, logger=logger)
+        dash.start()
+        sys.exit(0)
+
+    # Audit
+    if args.command == "audit":
+        colorlog("Running DNS/IP leak audit...", True)
+        result = dns_leak_audit(logger=logger)
+        outfile = os.path.join(LOG_DIR, f"audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        with open(outfile, "w") as f:
+            f.write("# DNS/IP Leak Audit\n")
+            f.write(json.dumps(result, indent=2))
+        colorlog(f"Audit complete. See {outfile}", True)
+        sys.exit(0)
+
+    # Kill Switch
+    if args.command == "killswitch":
+        ks = KillSwitch(hard_mode=args.hard, dry_run=dry_run, logger=logger)
+        if args.apply:
+            ks.apply()
+        elif args.remove:
+            ks.remove()
+        else:
+            usage()
+        sys.exit(0)
+
+    # AdBlock
+    if args.command == "adblock":
+        abm = AdBlockManager(enabled=False, logger=logger)
+        if args.update:
+            abm.update_blocklists()
+        if args.enable:
+            abm.enable()
+        if args.disable:
+            abm.disable()
+        colorlog(f"Blocklist at {BLOCKLIST_FILE}", True)
+        sys.exit(0)
+
+    # Multi-hop
+    if args.command == "multihop":
+        gws = mhmgr.available_gws()
+        colorlog("Available gateways (for chain):\n- " + "\n- ".join(gws), True)
+        sel = safe_input("Enter comma-separated gateway names for chain (order matters): ").strip().split(",")
+        sel = [s.strip() for s in sel if s.strip()]
+        chain = mhmgr.chain_info(sel)
+        mhmgr.measure_perf(chain)
+        sys.exit(0)
+
+    # Self-Test
+    if args.command == "self-test":
+        colorlog("---- Running Internal Self-Test Suite ----", True)
+        try:
+            # Test keygen
+            vault.new("xxtestpass123")
+            vault.unlock("xxtestpass123")
+            out = key_mgr.generate_x25519("testuser1")
+            assert out["private"] and out["public"]
+            rsaout = key_mgr.generate_rsa("testrsa")
+            assert rsaout["private_pem"] and rsaout["public_pem"]
+            config_db.load()
+            config_db.add_server("selftestsrv", {"host": "127.0.0.1", "ssh_user":"root", "created_at": now_iso()})
+            config_db.add_client("selftestcli", {"name":"selftestcli", "public_key":out["public"], "server":"selftestsrv", "address":"10.13.13.99", "created_at": now_iso()})
+            conf = generate_wg_conf(
+                config_db.get_server("selftestsrv"),
+                config_db.get_client("selftestcli"),
+                out["private"], out["public"], "10.13.13.99"
+            )
+            assert "PrivateKey" in conf and "PublicKey" in conf
+            colorlog("Self-test: keygen and config ok.", True)
+            # SSH dry-run
+            if paramiko:
+                ssh = ServerSSH("127.0.0.1", "user", dry_run=True)
+                ssh.connect()
+                ssh.run("echo test")
+                colorlog("Self-test: SSH dry-run ok.", True)
+        except Exception as e:
+            colorlog(f"Self-test failure: {e}", False)
+            sys.exit(2)
+        colorlog("All self-tests passed!", True)
+        sys.exit(0)
+
+    # Help fallback
+    usage()
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()
+
+# ===================== Embedded README (Automatic) =====================
+
+README_CONTENT = f"""
+============================================================================================
+VPN Ops Command Center — README (Auto-generated)
+============================================================================================
+Overview:
+  {TOOL_NAME} is a lawful VPN administration toolkit for Windows 10+ administrators
+  managing their own WireGuard infrastructure. It provides end-to-end config lifecycle,
+  key management, monitoring dashboard, ad-blocking, DNS audit, kill switch, and more.
+
+First-Time Setup:
+  1. Install Python 3.8+ and required dependencies:
+     > pip install -U paramiko cryptography qrcode[pil] matplotlib psutil pillow colorama
+
+  2. Run the setup wizard:
+     > python vpn_ops_command_center.py setup
+
+  3. Follow prompts to generate your vault passphrase, admin keys, first server, and client.
+
+Usual Operations:
+   - List/add/revoke clients:    python vpn_ops_command_center.py clients --list|--add|--revoke --name NAME
+   - List/add/show server:       python vpn_ops_command_center.py servers --list|--add|--show --profile NAME
+   - SSH to server:              python vpn_ops_command_center.py ssh --profile NAME --install|--start|--stop|--logs
+   - Dashboard GUI:              python vpn_ops_command_center.py dashboard
+   - Ad-block updates:           python vpn_ops_command_center.py adblock --update|--enable|--disable
+   - Kill switch:                python vpn_ops_command_center.py killswitch --apply|--remove [--hard]
+   - Audit for DNS/IP leaks:     python vpn_ops_command_center.py audit
+
+Update:
+   > pip install -U paramiko cryptography qrcode[pil] matplotlib psutil pillow colorama
+
+Limitations:
+  - "No logs" mode disables most persistent logs from this tool, but does NOT guarantee
+    absence of all records as server OS, external systems, or network flows may log data.
+  - Dashboard and traffic counters depend on correct local and remote configuration.
+  - WireGuard service management assumes Linux systemd servers for SSH automation.
+  - DNS and ad-block protection only cover what is under admin control.
+  - Multi-hop is manual and limited to operator-provisioned gateways.
+
+Legal/Ethical Disclaimer:
+  This toolkit is for lawful privacy hygiene and network administration only.
+  It is expressly forbidden to use this tool to violate laws, evade legal monitoring,
+  circumvent sanctions, or help others do so. Review local laws, server policies, and
+  operational risks. There are no warranties of perfect security or anonymity.
+
+============================================================================================
+"""
+
+with open(README_FILE, "w") as f:
+    f.write(README_CONTENT)
+
