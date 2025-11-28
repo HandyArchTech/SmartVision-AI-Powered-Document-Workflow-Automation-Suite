@@ -63,17 +63,17 @@ try:
 except ImportError:
     paramiko = None
 
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCM
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes, serialization, hmac as c_hmac
+from cryptography.hazmat.backends import default_backend
+
 try:
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     from cryptography.hazmat.primitives.kdf.argon2 import Argon2
-    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCM
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-    from cryptography.hazmat.primitives.asymmetric import rsa, padding
-    from cryptography.hazmat.primitives import hashes, serialization, hmac as c_hmac
-    from cryptography.hazmat.backends import default_backend
     HAS_ARGON2 = True
-except Exception:
-    # Argon2 available only in cryptography>=41.0.0
+except ImportError:
     HAS_ARGON2 = False
 
 try:
@@ -145,6 +145,17 @@ def safe_input(prompt):
         return input(prompt)
     except EOFError:
         return ''
+
+def safe_getpass(prompt):
+    try:
+        return getpass.getpass(prompt)
+    except Exception:
+        print("(Note: Password will be visible as you type)")
+        return safe_input(prompt)
+
+def get_vault_passphrase_from_env():
+    """Try to get vault passphrase from environment variable (Replit Secrets)"""
+    return os.environ.get('VAULT_PASSPHRASE', None)
 
 class DummyLogger:
     def debug(self, *a, **k): pass
@@ -365,6 +376,24 @@ class Vault:
         if self._locked:
             return {}
         return dict(self._data)
+
+    def change_passphrase(self, new_passphrase: str):
+        if self._locked:
+            raise Exception("Vault must be unlocked first.")
+        salt = random_bytes(16)
+        new_key = self.derive_key(new_passphrase, salt)
+        nonce = random_bytes(12)
+        cipher = ChaCha20Poly1305(new_key)
+        ad = b"vault"
+        plaintext = json.dumps(self._data).encode('utf8')
+        ciphertext = cipher.encrypt(nonce, plaintext, ad)
+        tag = ciphertext[-16:]
+        body = (
+            b'VOPSC1' + salt + nonce + ciphertext[:-16] + tag
+        )
+        atomic_write(self.filename, body)
+        self._masterkey = new_key
+        self.logger.info("Vault passphrase changed successfully.")
 
 # ===================== Key Generation (WireGuard X25519, RSA) =====================
 
@@ -942,8 +971,8 @@ class GuidedSetup:
             return
         passphrase = ''
         while not passphrase:
-            p1 = getpass.getpass("Enter NEW vault passphrase: ")
-            p2 = getpass.getpass("Confirm passphrase: ")
+            p1 = safe_getpass("Enter NEW vault passphrase: ")
+            p2 = safe_getpass("Confirm passphrase: ")
             if len(p1) < 8:
                 colorlog("Passphrase should be at least 8 chars.", False)
                 continue
@@ -998,6 +1027,8 @@ Usage:
 
   Commands:
     setup                 Guided first-time setup wizard
+    reset                 Erase vault and all config (start fresh)
+    change-passphrase     Change your vault passphrase
     clients               List or manage clients (--list, --add, --revoke, --export, --qr, --rotate)
     servers               List or manage server profiles (--list, --add, --show, --remove)
     ssh                   SSH operation (install, start, stop, logs, upload, download)
@@ -1027,6 +1058,11 @@ Examples:
 Notes:
   - All config, secrets, and keys are managed in {VDIR}
   - For lawful privacy hygiene and administration only. See legal/ethics header.
+
+Auto-Unlock:
+  - Set VAULT_PASSPHRASE in Replit Secrets (or environment) to auto-unlock
+  - The vault will unlock automatically without prompting for passphrase
+  - If not set, you'll be prompted to enter the passphrase manually
 ==================================================================================
 """)
 
@@ -1084,19 +1120,99 @@ def main():
         GuidedSetup(vault, config_db, key_mgr, logger).run()
         sys.exit(0)
 
+    # Reset vault (clear everything)
+    if args.command == "reset":
+        if not os.path.exists(vault.filename):
+            colorlog("No vault exists. Nothing to reset.", False)
+            sys.exit(0)
+        colorlog("WARNING: This will delete your vault, all keys, and all configuration!", False)
+        colorlog("You will need to run 'setup' again to create a new vault.", False)
+        if not confirm("Are you sure you want to completely reset?", auto_approve):
+            colorlog("Reset cancelled.", True)
+            sys.exit(0)
+        try:
+            if os.path.exists(VAULT_FILE):
+                secure_erase(VAULT_FILE)
+            if os.path.exists(CONFIG_DB):
+                secure_erase(CONFIG_DB)
+            for f in os.listdir(PROFILE_DIR):
+                secure_erase(os.path.join(PROFILE_DIR, f))
+            for f in os.listdir(CLIENT_DIR):
+                secure_erase(os.path.join(CLIENT_DIR, f))
+            colorlog("Vault and all configuration have been erased.", True)
+            colorlog("Run 'python main.py setup' to start fresh.", True)
+        except Exception as e:
+            colorlog(f"Error during reset: {e}", False)
+        sys.exit(0)
+
+    # Change passphrase
+    if args.command == "change-passphrase":
+        if not os.path.exists(vault.filename):
+            colorlog("Vault does not exist. Run setup first.", False)
+            sys.exit(1)
+        colorlog("First, unlock with your current passphrase:", True)
+        # Try auto-unlock first
+        env_passphrase = get_vault_passphrase_from_env()
+        unlocked = False
+        if env_passphrase:
+            try:
+                vault.unlock(env_passphrase)
+                colorlog("Vault unlocked using stored passphrase.", True)
+                unlocked = True
+            except Exception:
+                pass
+        if not unlocked:
+            for i in range(3):
+                try:
+                    old_pass = safe_getpass("Enter current vault passphrase: ")
+                    vault.unlock(old_pass)
+                    break
+                except Exception as e:
+                    colorlog(str(e), False)
+                    if i == 2:
+                        sys.exit(1)
+        new_pass = ''
+        while not new_pass:
+            p1 = safe_getpass("Enter NEW passphrase: ")
+            p2 = safe_getpass("Confirm NEW passphrase: ")
+            if len(p1) < 8:
+                colorlog("Passphrase should be at least 8 characters.", False)
+                continue
+            if p1 != p2:
+                colorlog("Passphrases do not match.", False)
+                continue
+            new_pass = p1
+        vault.change_passphrase(new_pass)
+        colorlog("Vault passphrase changed successfully!", True)
+        sys.exit(0)
+
     # Unlock vault
     if not os.path.exists(vault.filename):
         colorlog("Vault does not exist. Run 'python vpn_ops_command_center.py setup' first.", False)
         sys.exit(1)
-    for i in range(3):
+    
+    # Try auto-unlock from environment variable (Replit Secrets)
+    env_passphrase = get_vault_passphrase_from_env()
+    if env_passphrase:
         try:
-            passphrase = getpass.getpass("Enter vault passphrase: ")
-            vault.unlock(passphrase)
-            break
+            vault.unlock(env_passphrase)
+            colorlog("Vault unlocked automatically using stored passphrase.", True)
         except Exception as e:
-            colorlog(str(e), False)
-            if i == 2:
-                sys.exit(1)
+            colorlog(f"Auto-unlock failed: {e}", False)
+            colorlog("Falling back to manual passphrase entry...", False)
+            env_passphrase = None
+    
+    # Manual unlock if auto-unlock not available or failed
+    if not env_passphrase or vault._locked:
+        for i in range(3):
+            try:
+                passphrase = safe_getpass("Enter vault passphrase: ")
+                vault.unlock(passphrase)
+                break
+            except Exception as e:
+                colorlog(str(e), False)
+                if i == 2:
+                    sys.exit(1)
 
     # ConfigDB load
     try:
@@ -1401,4 +1517,3 @@ Legal/Ethical Disclaimer:
 
 with open(README_FILE, "w") as f:
     f.write(README_CONTENT)
-
